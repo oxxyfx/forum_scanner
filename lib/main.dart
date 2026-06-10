@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:html/dom.dart' as dom;
@@ -350,6 +351,10 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
 
     if (!mounted) return;
     setState(() {});
+
+    // Tell NodeBB itself the topic is read, so /api/unread stops returning
+    // it on future syncs and we don't keep re-downloading it.
+    unawaited(_setServerTopicReadState(post, true));
   }
 
   Future<void> _markPostUnread(_ForumPost post) async {
@@ -358,6 +363,20 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
 
     if (!mounted) return;
     setState(() {});
+
+    unawaited(_setServerTopicReadState(post, false));
+  }
+
+  /// Best-effort: updates the topic's read state on the NodeBB server.
+  /// Failures are silent (e.g. offline) — local _readPostKeys remains the
+  /// source of truth for the UI either way.
+  Future<void> _setServerTopicReadState(_ForumPost post, bool read) async {
+    try {
+      final service = SmfService(source: post.source);
+      final loggedIn = await service.login();
+      if (!loggedIn) return;
+      await service.setTopicReadState(post.raw, read);
+    } catch (_) {}
   }
 
   Future<void> _markPmRead(_ForumPrivateMessage pm) async {
@@ -401,24 +420,41 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
       _status = 'Syncing forums...';
     });
 
+    final syncStopwatch = Stopwatch()..start();
     final posts = <_ForumPost>[];
     final calendarEntries = <_ForumCalendarEntry>[];
     final privateMessages = <_ForumPrivateMessage>[];
 
     for (final source in activeSources) {
+      final sourceStopwatch = Stopwatch()..start();
       final service = SmfService(source: source);
 
+      final loginSw = Stopwatch()..start();
       final loggedIn = await service.login();
+      loginSw.stop();
+      print('[SYNC] ${source.name}: login took ${loginSw.elapsedMilliseconds}ms (success=$loggedIn)');
       if (!loggedIn) continue;
 
+      final unreadSw = Stopwatch()..start();
       final unreadData = await service.fetchUnreadTopics();
       posts.addAll(_parsePosts(source, unreadData));
+      unreadSw.stop();
+      print('[SYNC] ${source.name}: fetchUnreadTopics took ${unreadSw.elapsedMilliseconds}ms');
 
+      final calendarSw = Stopwatch()..start();
       final calendarData = await service.fetchCalendarEvents();
       calendarEntries.addAll(_parseCalendarEntries(source, calendarData));
+      calendarSw.stop();
+      print('[SYNC] ${source.name}: fetchCalendarEvents took ${calendarSw.elapsedMilliseconds}ms');
 
+      final pmSw = Stopwatch()..start();
       final pmData = await service.fetchPrivateMessages();
       privateMessages.addAll(_parsePrivateMessages(source, pmData));
+      pmSw.stop();
+      print('[SYNC] ${source.name}: fetchPrivateMessages took ${pmSw.elapsedMilliseconds}ms');
+
+      sourceStopwatch.stop();
+      print('[SYNC] ${source.name}: total ${sourceStopwatch.elapsedMilliseconds}ms');
     }
 
     // Auto-unhide PMs that received a new message since they were hidden
@@ -430,11 +466,14 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     }
     await _saveHiddenPmMap();
 
-    // Auto-mark-unread posts that NodeBB now reports as unread again
-    // (e.g. a new reply landed after we'd marked the post read locally).
+    // Auto-mark-unread posts that NodeBB's server-side "unread" tray now
+    // reports as unread again (e.g. a new reply landed after we'd marked
+    // the post read). Only trust the genuine /api/unread feed for this —
+    // the /api/recent fallback can list topics the user has already read,
+    // and shouldn't resurrect them.
     var readKeysChanged = false;
     for (final p in posts) {
-      if (_readPostKeys.remove(p.key)) {
+      if (p.raw['_feedType'] == 'unread' && _readPostKeys.remove(p.key)) {
         readKeysChanged = true;
       }
     }
@@ -485,9 +524,13 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
       return lastRead == null || pm.sortStamp > lastRead;
     }).length;
 
+    syncStopwatch.stop();
+    final syncSeconds = (syncStopwatch.elapsedMilliseconds / 1000).toStringAsFixed(1);
+    print('[SYNC] TOTAL sync took ${syncStopwatch.elapsedMilliseconds}ms (${syncSeconds}s)');
+
     if (mounted) {
       setState(() {
-        _status = 'Sync complete. $unreadPosts unread post(s), ${_calendarEntries.length} calendar item(s), ${_privateMessages.length} PM(s).';
+        _status = 'Sync complete in ${syncSeconds}s. $unreadPosts unread post(s), ${_calendarEntries.length} calendar item(s), ${_privateMessages.length} PM(s).';
       });
     }
 

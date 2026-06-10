@@ -120,6 +120,11 @@ class SmfService {
           }
 
           if (data['topics'] is List && (data['topics'] as List).isNotEmpty) {
+            // Tag each topic so callers know these came from NodeBB's
+            // genuine per-user "unread" tray (server-authoritative).
+            for (final t in (data['topics'] as List)) {
+              if (t is Map) (t as Map)['_feedType'] = 'unread';
+            }
             return data;
           }
         }
@@ -136,6 +141,13 @@ class SmfService {
 
           if (recentData.containsKey('posts') && !recentData.containsKey('topics')) {
             recentData['topics'] = recentData['posts'];
+          }
+          // Tag as 'recent': just activity, not a server-confirmed unread
+          // signal — a topic the user already read can still show up here.
+          if (recentData['topics'] is List) {
+            for (final t in (recentData['topics'] as List)) {
+              if (t is Map) (t as Map)['_feedType'] = 'recent';
+            }
           }
           return recentData;
         }
@@ -503,7 +515,17 @@ class SmfService {
           .build(),
     );
 
+    var requestsSent = false;
     socket.onConnect((_) {
+      // socket.io-client-dart can fire 'connect' more than once for a single
+      // logical connection (e.g. polling connect, then websocket upgrade).
+      // Only send the batch of month requests once — otherwise the extra
+      // completers added on the second firing never get acked (the socket
+      // is mid-upgrade/disconnect by then), Future.wait never resolves, and
+      // we eat the full connectCompleter timeout below for nothing.
+      if (requestsSent) return;
+      requestsSent = true;
+
       print('Calendar socket connected to ${source.name}, sending ${ranges.length} parallel requests');
       for (int i = 0; i < ranges.length; i++) {
         final c = Completer<List<Map<String, dynamic>>>();
@@ -997,6 +1019,55 @@ class SmfService {
       print(stacktrace);
       return [];
     }
+  }
+
+  /// Marks a topic as read (or unread) on the NodeBB server itself, via the
+  /// write API (`PUT`/`DELETE /api/v3/topics/:tid/read`). This updates the
+  /// user's server-side read state so that `/api/unread` no longer returns
+  /// this topic on subsequent syncs (when [read] is true), or returns it
+  /// again (when [read] is false).
+  Future<bool> setTopicReadState(Map<String, dynamic> topic, bool read) async {
+    try {
+      final dynamic rawTid = topic['tid'] ?? topic['topic']?['tid'];
+      if (rawTid == null) {
+        print('setTopicReadState: topic has no tid, skipping. Keys: ${topic.keys.toList()}');
+        return false;
+      }
+
+      final String tid = rawTid.toString();
+      final String topicUrl = _topicUrlFromTopic(topic, tid);
+      final csrf = await _refreshCsrfToken(path: Uri.parse(topicUrl).path);
+      final String endpoint = '$_cleanBaseUrl/api/v3/topics/$tid/read';
+
+      final response = await (read ? _dio.put(endpoint, options: _writeOptions(csrf, topicUrl))
+                                    : _dio.delete(endpoint, options: _writeOptions(csrf, topicUrl)));
+
+      print('setTopicReadState($tid, read=$read) status: ${response.statusCode}');
+      print('setTopicReadState($tid, read=$read) response: ${response.data}');
+
+      return response.statusCode != null &&
+          response.statusCode! >= 200 &&
+          response.statusCode! < 300;
+    } catch (e, stacktrace) {
+      print('setTopicReadState failed: $e');
+      print('setTopicReadState stacktrace: $stacktrace');
+      return false;
+    }
+  }
+
+  Options _writeOptions(String? csrf, String referer) {
+    return Options(
+      contentType: Headers.jsonContentType,
+      responseType: ResponseType.json,
+      headers: {
+        'Accept': 'application/json, text/javascript, */*; q=0.01',
+        'Origin': _cleanBaseUrl,
+        'Referer': referer,
+        'X-Requested-With': 'XMLHttpRequest',
+        if (csrf != null && csrf.isNotEmpty) 'x-csrf-token': csrf,
+      },
+      validateStatus: (status) => status != null && status < 600,
+    );
   }
 
   Future<bool> replyToTopic(Map<String, dynamic> topic, String message) async {
