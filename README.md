@@ -1,4 +1,4 @@
-# smf_follower_app
+# forum_scanner app
 
 Flutter project to check SMF forum posts
 
