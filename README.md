@@ -1,6 +1,6 @@
 # forum_scanner app
 
-Flutter project to check SMF forum posts
+Flutter project to check bbNote forum posts
 
 ## Getting Started
 
