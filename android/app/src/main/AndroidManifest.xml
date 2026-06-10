@@ -28,6 +28,17 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+
+        <!-- Disable Impeller/Vulkan: this device's Mali GPU gralloc doesn't
+             support the R8 texture format Impeller uses, which causes
+             rendering errors and the app failing to redraw on relaunch.
+             Falls back to the Skia (OpenGL) renderer. -->
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableImpeller"
+            android:value="false" />
+        <meta-data
+            android:name="io.flutter.embedding.android.EnableVulkan"
+            android:value="false" />
     </application>
 
     <queries>

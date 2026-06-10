@@ -5,6 +5,7 @@ import 'package:html/parser.dart' as html_parser;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'background_sync.dart';
+import 'background_task.dart';
 import 'forum_source.dart';
 import 'smf_service.dart';
 import 'storage_service.dart';
@@ -19,6 +20,7 @@ void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   await initNotifications();
+  await registerBackgroundSync();
   runApp(const ForumAggregatorApp());
 }
 
@@ -59,12 +61,19 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
   Map<String, int> _readPmStamps = {};
   Map<String, int> _hiddenPmMap = {};
   bool _showHiddenPms = false;
+  bool _showReadPosts = false;
+  String _postSearchQuery = '';
+  final TextEditingController _postSearchController = TextEditingController();
 
   late final TabController _tabController;
   bool _isLoading = false;
   String _status = 'Ready';
   String _calendarView = 'list'; // 'list' or 'calendar'
   DateTime _calendarDisplayMonth = DateTime(DateTime.now().year, DateTime.now().month);
+  final TransformationController _calendarTransformController = TransformationController();
+  double _calendarZoom = 1.0;
+  int _calendarActivePointers = 0;
+  bool _calendarMultiTouch = false;
 
   DateTime? _lastSyncTime;
 
@@ -81,6 +90,8 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _tabController.dispose();
+    _calendarTransformController.dispose();
+    _postSearchController.dispose();
     super.dispose();
   }
 
@@ -120,7 +131,7 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     final cachedCalendar  = await _storage.loadJsonList('cached_calendar');
 
     if (!mounted) return;
-    final posts    = cachedPosts.map(_postFromJson).whereType<_ForumPost>().where((p) => !readKeys.contains(p.key)).toList()..sort((a, b) => b.sortStamp.compareTo(a.sortStamp));
+    final posts    = cachedPosts.map(_postFromJson).whereType<_ForumPost>().toList()..sort((a, b) => b.sortStamp.compareTo(a.sortStamp));
     final pms      = cachedPms.map(_pmFromJson).whereType<_ForumPrivateMessage>().toList()..sort((a, b) => b.sortStamp.compareTo(a.sortStamp));
     final calendar = cachedCalendar.map(_calendarFromJson).whereType<_ForumCalendarEntry>().toList()..sort((a, b) => a.start.compareTo(b.start));
 
@@ -338,9 +349,15 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     await _saveReadPostKeys();
 
     if (!mounted) return;
-    setState(() {
-      _posts = _posts.where((p) => p.key != post.key).toList();
-    });
+    setState(() {});
+  }
+
+  Future<void> _markPostUnread(_ForumPost post) async {
+    _readPostKeys.remove(post.key);
+    await _saveReadPostKeys();
+
+    if (!mounted) return;
+    setState(() {});
   }
 
   Future<void> _markPmRead(_ForumPrivateMessage pm) async {
@@ -413,16 +430,26 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     }
     await _saveHiddenPmMap();
 
+    // Auto-mark-unread posts that NodeBB now reports as unread again
+    // (e.g. a new reply landed after we'd marked the post read locally).
+    var readKeysChanged = false;
+    for (final p in posts) {
+      if (_readPostKeys.remove(p.key)) {
+        readKeysChanged = true;
+      }
+    }
+    if (readKeysChanged) {
+      await _saveReadPostKeys();
+    }
+
     if (!mounted) return;
 
-    // Merge posts: keep existing unread cached posts, overlay with freshly fetched ones
+    // Merge posts: keep all cached posts (read or unread), overlay with freshly fetched ones.
     final mergedPostMap = <String, _ForumPost>{for (final p in _posts) p.key: p};
     for (final p in posts) {
       mergedPostMap[p.key] = p;
     }
-    final mergedPosts = mergedPostMap.values
-        .where((p) => !_readPostKeys.contains(p.key))
-        .toList()
+    final mergedPosts = mergedPostMap.values.toList()
       ..sort((a, b) => b.sortStamp.compareTo(a.sortStamp));
 
     final mergedPms = privateMessages
@@ -447,17 +474,24 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
       _privateMessages = mergedPms;
       _isLoading = false;
       _lastSyncTime = DateTime.now();
-      _status = 'Sync complete. ${_posts.length} unread post(s), ${_calendarEntries.length} calendar item(s), ${_privateMessages.length} PM(s).';
     });
 
     await _saveCache();
 
-    // Update notification badge with current unread counts
+    // Update notification badge / status with current unread counts
+    final unreadPosts = _posts.where((p) => !_readPostKeys.contains(p.key)).length;
     final unreadPms = _privateMessages.where((pm) {
       final lastRead = _readPmStamps[pm.key];
       return lastRead == null || pm.sortStamp > lastRead;
     }).length;
-    await showNewContentNotification(_posts.length, unreadPms);
+
+    if (mounted) {
+      setState(() {
+        _status = 'Sync complete. $unreadPosts unread post(s), ${_calendarEntries.length} calendar item(s), ${_privateMessages.length} PM(s).';
+      });
+    }
+
+    await showNewContentNotification(unreadPosts, unreadPms);
   }
 
   String _decodeHtmlText(String value) {
@@ -623,13 +657,21 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
 
   @override
   Widget build(BuildContext context) {
+    final onPostsTab = _tabController.index == 0;
     final onPmTab = _tabController.index == 2;
     final hasHiddenPms = _privateMessages.any((pm) => _hiddenPmMap.containsKey(pm.key));
+    final hasReadPosts = _posts.any((p) => _readPostKeys.contains(p.key));
 
     return Scaffold(
         appBar: AppBar(
           title: const Text('Forum Scanner'),
           actions: [
+            if (onPostsTab && hasReadPosts)
+              IconButton(
+                icon: Icon(_showReadPosts ? Icons.visibility : Icons.visibility_off),
+                tooltip: _showReadPosts ? 'Hide read posts' : 'Show read posts',
+                onPressed: () => setState(() => _showReadPosts = !_showReadPosts),
+              ),
             if (onPmTab && hasHiddenPms)
               IconButton(
                 icon: Icon(_showHiddenPms ? Icons.visibility : Icons.visibility_off),
@@ -683,30 +725,104 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
 
   Widget _buildPostsTab() {
     if (_posts.isEmpty) {
-      return const _EmptyState(icon: Icons.mark_chat_read, message: 'No unread posts to show.');
+      return const _EmptyState(icon: Icons.mark_chat_read, message: 'No posts to show.');
     }
 
-    return RefreshIndicator(
-      onRefresh: _syncAll,
-      child: ListView.separated(
-        itemCount: _posts.length,
-        separatorBuilder: (_, __) => const Divider(height: 1),
-        itemBuilder: (context, index) {
-          final post = _posts[index];
-          final color = Color(post.source.colorValue);
+    final query = _postSearchQuery.trim().toLowerCase();
 
-          return ListTile(
-            leading: CircleAvatar(backgroundColor: color, radius: 8),
-            title: Text(post.title),
-            subtitle: Text(_postSubtitle(post)),
-            onTap: () => _openPost(post),
-            trailing: IconButton(
-              icon: const Icon(Icons.check),
-              tooltip: 'Mark read',
-              onPressed: () => _markPostRead(post),
+    final visible = _posts.where((p) {
+      final isRead = _readPostKeys.contains(p.key);
+      if (isRead && !_showReadPosts) return false;
+
+      if (query.isEmpty) return true;
+      return p.title.toLowerCase().contains(query) ||
+          p.author.toLowerCase().contains(query) ||
+          p.source.name.toLowerCase().contains(query);
+    }).toList();
+
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onTap: () => FocusScope.of(context).unfocus(),
+      child: Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          child: TextField(
+            controller: _postSearchController,
+            textInputAction: TextInputAction.search,
+            decoration: InputDecoration(
+              hintText: 'Search posts...',
+              prefixIcon: const Icon(Icons.search),
+              isDense: true,
+              border: const OutlineInputBorder(),
+              suffixIcon: _postSearchQuery.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.clear),
+                      onPressed: () {
+                        _postSearchController.clear();
+                        setState(() => _postSearchQuery = '');
+                        FocusScope.of(context).unfocus();
+                      },
+                    ),
             ),
-          );
-        },
+            onChanged: (value) => setState(() => _postSearchQuery = value),
+            onSubmitted: (_) => FocusScope.of(context).unfocus(),
+          ),
+        ),
+        Expanded(
+          child: visible.isEmpty
+              ? _EmptyState(
+                  icon: Icons.mark_chat_read,
+                  message: query.isNotEmpty
+                      ? 'No posts match your search.'
+                      : 'No unread posts. Tap the eye icon to show read posts.',
+                )
+              : RefreshIndicator(
+                  onRefresh: _syncAll,
+                  child: ListView.separated(
+                    keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
+                    itemCount: visible.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1),
+                    itemBuilder: (context, index) {
+                      final post = visible[index];
+                      final color = Color(post.source.colorValue);
+                      final isRead = _readPostKeys.contains(post.key);
+
+                      return Container(
+                        color: isRead ? null : Theme.of(context).colorScheme.primary.withValues(alpha: 0.08),
+                        child: ListTile(
+                          leading: CircleAvatar(backgroundColor: color, radius: 8),
+                          title: Text(
+                            post.title,
+                            style: TextStyle(
+                              fontWeight: isRead ? FontWeight.normal : FontWeight.bold,
+                              color: isRead ? Theme.of(context).disabledColor : null,
+                            ),
+                          ),
+                          subtitle: Text(_postSubtitle(post)),
+                          onTap: () async {
+                            FocusScope.of(context).unfocus();
+                            await _markPostRead(post);
+                            if (!mounted) return;
+                            await _openPost(post);
+                          },
+                          trailing: IconButton(
+                            icon: Icon(
+                              isRead ? Icons.undo : Icons.check,
+                              size: 20,
+                              color: isRead ? Theme.of(context).colorScheme.primary : Theme.of(context).disabledColor,
+                            ),
+                            tooltip: isRead ? 'Mark unread' : 'Mark read',
+                            onPressed: () => isRead ? _markPostUnread(post) : _markPostRead(post),
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
+        ),
+      ],
       ),
     );
   }
@@ -832,130 +948,215 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     final int totalSlots = startOffset + daysInMonth;
     final int numWeeks = (totalSlots / 7).ceil();
 
-    return SingleChildScrollView(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // Month navigation header
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
-            child: Row(
-              children: [
-                IconButton(
-                  icon: const Icon(Icons.chevron_left),
-                  onPressed: () => setState(() {
-                    _calendarDisplayMonth = DateTime(year, month - 1);
-                  }),
+    final gridWidth = MediaQuery.of(context).size.width;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        // Month navigation header (stays fixed — not affected by zoom/pan)
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 4),
+          child: Row(
+            children: [
+              IconButton(
+                icon: const Icon(Icons.chevron_left),
+                onPressed: () => setState(() {
+                  _calendarDisplayMonth = DateTime(year, month - 1);
+                  _calendarTransformController.value = Matrix4.identity();
+                  _calendarZoom = 1.0;
+                }),
+              ),
+              Expanded(
+                child: Text(
+                  '${monthNames[month - 1]} $year',
+                  textAlign: TextAlign.center,
+                  style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
                 ),
-                Expanded(
-                  child: Text(
-                    '${monthNames[month - 1]} $year',
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
+              ),
+              IconButton(
+                icon: const Icon(Icons.chevron_right),
+                onPressed: () => setState(() {
+                  _calendarDisplayMonth = DateTime(year, month + 1);
+                  _calendarTransformController.value = Matrix4.identity();
+                  _calendarZoom = 1.0;
+                }),
+              ),
+            ],
+          ),
+        ),
+        if (_calendarZoom > 1.01)
+          Padding(
+            padding: const EdgeInsets.only(bottom: 2),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text(
+                  'Pinch to zoom • drag to pan',
+                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                    color: Theme.of(context).colorScheme.onSurfaceVariant,
                   ),
                 ),
-                IconButton(
-                  icon: const Icon(Icons.chevron_right),
-                  onPressed: () => setState(() {
-                    _calendarDisplayMonth = DateTime(year, month + 1);
-                  }),
+                const SizedBox(width: 8),
+                InkWell(
+                  borderRadius: BorderRadius.circular(12),
+                  onTap: () {
+                    _calendarTransformController.value = Matrix4.identity();
+                    setState(() => _calendarZoom = 1.0);
+                  },
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    child: Row(
+                      children: [
+                        Icon(Icons.zoom_out_map, size: 14, color: Theme.of(context).colorScheme.primary),
+                        const SizedBox(width: 2),
+                        Text(
+                          'Reset',
+                          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                            color: Theme.of(context).colorScheme.primary,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
               ],
             ),
           ),
-          // Day-of-week header row
-          Table(
-            border: TableBorder.all(
-              color: Theme.of(context).dividerColor,
-              width: 0.5,
-            ),
-            columnWidths: const {0:FlexColumnWidth(),1:FlexColumnWidth(),2:FlexColumnWidth(),
-                                   3:FlexColumnWidth(),4:FlexColumnWidth(),5:FlexColumnWidth(),6:FlexColumnWidth()},
-            children: [
-              TableRow(
-                decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceContainerHighest),
-                children: dowLabels.map((d) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4),
-                  child: Center(
-                    child: Text(d,
-                      style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                        fontWeight: FontWeight.bold,
-                      ),
+        // Zoomable / pannable month grid
+        Expanded(
+          child: ClipRect(
+            child: Listener(
+              behavior: HitTestBehavior.translucent,
+              onPointerDown: (_) {
+                _calendarActivePointers++;
+                if (_calendarActivePointers >= 2) _calendarMultiTouch = true;
+              },
+              onPointerUp: (_) {
+                _calendarActivePointers = (_calendarActivePointers - 1).clamp(0, 10);
+                if (_calendarActivePointers == 0) {
+                  Future.delayed(const Duration(milliseconds: 250), () {
+                    _calendarMultiTouch = false;
+                  });
+                }
+              },
+              onPointerCancel: (_) {
+                _calendarActivePointers = (_calendarActivePointers - 1).clamp(0, 10);
+              },
+              child: InteractiveViewer(
+              transformationController: _calendarTransformController,
+              minScale: 1.0,
+              maxScale: 4.0,
+              boundaryMargin: EdgeInsets.zero,
+              constrained: false,
+              panEnabled: _calendarZoom > 1.01,
+              scaleEnabled: true,
+              onInteractionEnd: (details) {
+                final scale = _calendarTransformController.value.getMaxScaleOnAxis();
+                if ((scale - _calendarZoom).abs() > 0.001) setState(() => _calendarZoom = scale);
+              },
+              child: SizedBox(
+                  width: gridWidth,
+                  child: Table(
+                    border: TableBorder.all(
+                      color: Theme.of(context).dividerColor,
+                      width: 0.5,
                     ),
-                  ),
-                )).toList(),
-              ),
-              // Week rows
-              ...List.generate(numWeeks, (weekIdx) {
-                return TableRow(
-                  children: List.generate(7, (colIdx) {
-                    final slot = weekIdx * 7 + colIdx;
-                    final dayNum = slot - startOffset + 1;
-                    if (dayNum < 1 || dayNum > daysInMonth) {
-                      return const SizedBox(height: 60);
-                    }
-                    final day = DateTime(year, month, dayNum);
-                    final isToday = day == today;
-                    final events = byDay[day] ?? [];
-                    const maxVisible = 3;
-                    final visible = events.take(maxVisible).toList();
-                    final overflow = events.length - maxVisible;
-
-                    return GestureDetector(
-                      onTap: events.isEmpty ? null : () {
-                        // Show day events in a bottom sheet
-                        showModalBottomSheet(
-                          context: context,
-                          builder: (_) => _buildDayEventsSheet(day, events),
-                        );
-                      },
-                      child: Container(
-                        constraints: const BoxConstraints(minHeight: 60),
-                        decoration: BoxDecoration(
-                          color: isToday
-                              ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.4)
-                              : null,
-                        ),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            // Day number
-                            Padding(
-                              padding: const EdgeInsets.only(top: 2, left: 3, right: 2),
-                              child: Text(
-                                '$dayNum',
-                                style: TextStyle(
-                                  fontSize: 11,
-                                  fontWeight: isToday ? FontWeight.bold : FontWeight.normal,
-                                  color: isToday
-                                      ? Theme.of(context).colorScheme.primary
-                                      : null,
-                                ),
+                    columnWidths: const {0:FlexColumnWidth(),1:FlexColumnWidth(),2:FlexColumnWidth(),
+                                           3:FlexColumnWidth(),4:FlexColumnWidth(),5:FlexColumnWidth(),6:FlexColumnWidth()},
+                    children: [
+                      TableRow(
+                        decoration: BoxDecoration(color: Theme.of(context).colorScheme.surfaceContainerHighest),
+                        children: dowLabels.map((d) => Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Center(
+                            child: Text(d,
+                              style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                                fontWeight: FontWeight.bold,
                               ),
                             ),
-                            // Event chips
-                            ...visible.map((e) => _buildEventChip(e)),
-                            if (overflow > 0)
-                              Padding(
-                                padding: const EdgeInsets.only(left: 2, bottom: 2),
-                                child: Text(
-                                  '+$overflow more',
-                                  style: Theme.of(context).textTheme.labelSmall?.copyWith(
-                                    color: Theme.of(context).colorScheme.onSurfaceVariant,
-                                  ),
+                          ),
+                        )).toList(),
+                      ),
+                      // Week rows
+                      ...List.generate(numWeeks, (weekIdx) {
+                        return TableRow(
+                          children: List.generate(7, (colIdx) {
+                            final slot = weekIdx * 7 + colIdx;
+                            final dayNum = slot - startOffset + 1;
+                            if (dayNum < 1 || dayNum > daysInMonth) {
+                              return const SizedBox(height: 60);
+                            }
+                            final day = DateTime(year, month, dayNum);
+                            final isToday = day == today;
+                            final events = byDay[day] ?? [];
+                            const maxVisible = 3;
+                            final visible = events.take(maxVisible).toList();
+                            final overflow = events.length - maxVisible;
+
+                            return GestureDetector(
+                              onTap: events.isEmpty ? null : () {
+                                // Briefly delay opening: if a second finger comes
+                                // down right after this (start of a pinch), skip it.
+                                Future.delayed(const Duration(milliseconds: 150), () {
+                                  if (!mounted || _calendarMultiTouch) return;
+                                  showModalBottomSheet(
+                                    context: context,
+                                    builder: (_) => _buildDayEventsSheet(day, events),
+                                  );
+                                });
+                              },
+                              child: Container(
+                                constraints: const BoxConstraints(minHeight: 60),
+                                decoration: BoxDecoration(
+                                  color: isToday
+                                      ? Theme.of(context).colorScheme.primaryContainer.withValues(alpha: 0.4)
+                                      : null,
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    // Day number
+                                    Padding(
+                                      padding: const EdgeInsets.only(top: 2, left: 3, right: 2),
+                                      child: Text(
+                                        '$dayNum',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          fontWeight: isToday ? FontWeight.bold : FontWeight.normal,
+                                          color: isToday
+                                              ? Theme.of(context).colorScheme.primary
+                                              : null,
+                                        ),
+                                      ),
+                                    ),
+                                    // Event chips
+                                    ...visible.map((e) => _buildEventChip(e)),
+                                    if (overflow > 0)
+                                      Padding(
+                                        padding: const EdgeInsets.only(left: 2, bottom: 2),
+                                        child: Text(
+                                          '+$overflow more',
+                                          style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                                            color: Theme.of(context).colorScheme.onSurfaceVariant,
+                                          ),
+                                        ),
+                                      ),
+                                  ],
                                 ),
                               ),
-                          ],
-                        ),
-                      ),
-                    );
-                  }),
-                );
-              }),
-            ],
+                            );
+                          }),
+                        );
+                      }),
+                    ],
+                  ),
+                ),
+              ),
+              ),
+            ),
           ),
-        ],
-      ),
+      ],
     );
   }
 
@@ -965,7 +1166,14 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     final luminance = bg.computeLuminance();
     final fg = luminance > 0.4 ? Colors.black87 : Colors.white;
     return GestureDetector(
-      onTap: () => _showCalendarDetails(entry),
+      onTap: () {
+        // Briefly delay opening: if a second finger comes down right after
+        // this (start of a pinch), skip it.
+        Future.delayed(const Duration(milliseconds: 150), () {
+          if (!mounted || _calendarMultiTouch) return;
+          _showCalendarDetails(entry);
+        });
+      },
       child: Container(
         margin: const EdgeInsets.only(left: 1, right: 1, bottom: 1),
         padding: const EdgeInsets.symmetric(horizontal: 3, vertical: 1),
