@@ -1,0 +1,55 @@
+name: forum_scanner
+description: "Forum Scanner - aggregate posts and PMs from NodeBB forums"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.9.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # HTTP client and persistent cookie tracking
+  dio: ^5.7.0
+  dio_cookie_manager: ^3.1.2
+  cookie_jar: ^4.0.8
+  path_provider: ^2.1.3
+
+  # XML Parsing for SMF feeds
+  xml: ^6.5.0
+
+  # Secure credential storage
+  flutter_secure_storage: ^9.2.2
+
+  cupertino_icons: ^1.0.8
+  shared_preferences: ^2.5.5
+  html: ^0.15.6
+  url_launcher: ^6.3.2
+  socket_io_client: ^2.0.3+1
+
+  # Local notifications (badge + new-content alerts on foreground sync)
+  flutter_local_notifications: ^18.0.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+  # Icon generation: run `dart run flutter_launcher_icons` after adding assets/icon.png
+  flutter_launcher_icons: ^0.14.3
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/icon.png"
+  min_sdk_android: 21
+  adaptive_icon_background: "#1565C0"
+  adaptive_icon_foreground: "assets/icon_fg.png"
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon.png
+    - assets/icon_fg.png
