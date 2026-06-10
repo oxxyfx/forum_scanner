@@ -628,7 +628,7 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
 
     return Scaffold(
         appBar: AppBar(
-          title: const Text('Forum Aggregator'),
+          title: const Text('Forum Scanner'),
           actions: [
             if (onPmTab && hasHiddenPms)
               IconButton(
