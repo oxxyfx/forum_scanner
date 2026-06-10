@@ -10,9 +10,18 @@ final FlutterLocalNotificationsPlugin flutterLocalNotifications =
 
 Future<void> initNotifications() async {
   const androidSettings = AndroidInitializationSettings('@mipmap/ic_launcher');
-  const settings = InitializationSettings(android: androidSettings);
+  const iosSettings = DarwinInitializationSettings(
+    requestAlertPermission: true,
+    requestBadgePermission: true,
+    requestSoundPermission: false,
+  );
+  const settings = InitializationSettings(
+    android: androidSettings,
+    iOS: iosSettings,
+  );
   await flutterLocalNotifications.initialize(settings);
 
+  // Android-only: create the notification channel
   const channel = AndroidNotificationChannel(
     kChannelId,
     'New content',
@@ -26,8 +35,7 @@ Future<void> initNotifications() async {
       ?.createNotificationChannel(channel);
 }
 
-/// Show (or update) the persistent notification with current unread counts.
-/// Call this after every sync that finds new content.
+/// Show (or update) the notification with current unread counts.
 Future<void> showNewContentNotification(int unreadPosts, int unreadPms) async {
   if (unreadPosts == 0 && unreadPms == 0) {
     await cancelNewContentNotification();
@@ -49,9 +57,15 @@ Future<void> showNewContentNotification(int unreadPosts, int unreadPms) async {
         channelDescription: 'Alerts when new forum posts or PMs arrive',
         importance: Importance.defaultImportance,
         priority: Priority.defaultPriority,
-        number: unreadPosts + unreadPms, // badge count shown on launcher icon
+        number: unreadPosts + unreadPms,
         ongoing: false,
         autoCancel: true,
+      ),
+      iOS: DarwinNotificationDetails(
+        badgeNumber: unreadPosts + unreadPms,
+        presentAlert: true,
+        presentBadge: true,
+        presentSound: false,
       ),
     ),
   );
