@@ -2,7 +2,7 @@ name: forum_scanner
 description: "Forum Scanner - aggregate posts and PMs from NodeBB forums"
 publish_to: 'none'
 
-version: 1.0.3+3
+version: 1.0.5+5
 
 environment:
   sdk: ^3.9.2
@@ -34,6 +34,12 @@ dependencies:
 
   # Background sync (Android WorkManager / iOS BGTaskScheduler)
   workmanager: ^0.9.0+3
+
+  # In-app browser for viewing the full forum site (long-press on Posts tab)
+  webview_flutter: ^4.10.0
+
+  # App version/build info for the About dialog on the settings screen
+  package_info_plus: ^8.1.2
 
 dev_dependencies:
   flutter_test:

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' show Cookie;
 import 'package:socket_io_client/socket_io_client.dart' as sio;
 import 'package:dio/dio.dart';
 import 'package:dio_cookie_manager/dio_cookie_manager.dart';
@@ -101,6 +102,13 @@ class SmfService {
       print('STACKTRACE: $stacktrace');
       return false;
     }
+  }
+
+  /// Returns the session cookies for this forum after [login] has
+  /// succeeded, so a WebView can be pre-authenticated with the same
+  /// session NodeBB issued to this Dio client.
+  Future<List<Cookie>> cookiesForWebView() async {
+    return _cookieJar.loadForRequest(Uri.parse(_cleanBaseUrl));
   }
 
   Future<Map<String, dynamic>?> fetchUnreadTopics() async {

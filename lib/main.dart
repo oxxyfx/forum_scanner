@@ -3,11 +3,13 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:html/dom.dart' as dom;
 import 'package:html/parser.dart' as html_parser;
+import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'background_sync.dart';
 import 'background_task.dart';
 import 'forum_source.dart';
+import 'forum_webview_screen.dart';
 import 'smf_service.dart';
 import 'storage_service.dart';
 
@@ -56,15 +58,23 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
   List<_ForumPost> _posts = [];
   List<_ForumCalendarEntry> _calendarEntries = [];
   List<_ForumPrivateMessage> _privateMessages = [];
-  Set<String> _readPostKeys = <String>{};
+  // Maps post.key → sortStamp when user last read it.
+  // A post is "unread" if its current sortStamp is greater than the stored
+  // stamp (or it was never marked read). This mirrors _readPmStamps below —
+  // using a stamp comparison instead of a plain read/unread set means a post
+  // stays "read" across syncs even if the forum's unread tray still lists it
+  // (e.g. because the server-side mark-as-read call didn't take), and only
+  // resurfaces once it genuinely has newer activity than when it was read.
+  Map<String, int> _readPostStamps = {};
   // Maps pm.key → sortStamp when user last read it.
   // A PM is "unread" if its current sortStamp is greater than the stored stamp.
   Map<String, int> _readPmStamps = {};
-  Map<String, int> _hiddenPmMap = {};
-  bool _showHiddenPms = false;
   bool _showReadPosts = false;
   String _postSearchQuery = '';
   final TextEditingController _postSearchController = TextEditingController();
+  bool _showReadPms = false;
+  String _pmSearchQuery = '';
+  final TextEditingController _pmSearchController = TextEditingController();
 
   late final TabController _tabController;
   bool _isLoading = false;
@@ -93,6 +103,7 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     _tabController.dispose();
     _calendarTransformController.dispose();
     _postSearchController.dispose();
+    _pmSearchController.dispose();
     super.dispose();
   }
 
@@ -112,17 +123,15 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
 
   Future<void> _loadEverything() async {
     final sources = await _storage.loadSources();
-    final readKeys = await _loadReadPostKeys();
+    final readPostStamps = await _loadReadPostStamps();
     final readPmStamps = await _loadReadPmStamps();
-    final hiddenPmMap = await _loadHiddenPmMap();
 
     if (!mounted) return;
     // Set sources first so deserializers can look them up
     setState(() {
       _sources = _normalizeSources(sources);
-      _readPostKeys = readKeys;
+      _readPostStamps = readPostStamps;
       _readPmStamps = readPmStamps;
-      _hiddenPmMap = hiddenPmMap;
       _status = sources.isEmpty ? 'Open setup to add forum accounts.' : 'Loaded ${sources.length} forum account(s).';
     });
 
@@ -286,9 +295,27 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
   }
 
 
-  Future<Set<String>> _loadReadPostKeys() async {
+  Future<Map<String, int>> _loadReadPostStamps() async {
     final prefs = await SharedPreferences.getInstance();
-    return prefs.getStringList('read_post_keys')?.toSet() ?? <String>{};
+    // New format: JSON map of key→sortStamp at time of reading.
+    final raw = prefs.getString('read_post_stamps');
+    if (raw != null && raw.isNotEmpty) {
+      try {
+        final decoded = jsonDecode(raw) as Map;
+        return decoded.map((k, v) => MapEntry(k.toString(), (v as num).toInt()));
+      } catch (_) {}
+    }
+    // Migrate from the old plain read/unread set. We don't know what each
+    // post's sortStamp was when it was marked read, so treat them as "read
+    // as of right now" — they stay hidden unless the topic gets newer
+    // activity than this migration moment.
+    final oldKeys = prefs.getStringList('read_post_keys') ?? [];
+    if (oldKeys.isEmpty) return {};
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final migrated = {for (final k in oldKeys) k: now};
+    await prefs.setString('read_post_stamps', jsonEncode(migrated));
+    await prefs.remove('read_post_keys');
+    return migrated;
   }
 
   Future<Map<String, int>> _loadReadPmStamps() async {
@@ -311,43 +338,14 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     await prefs.setString('read_pm_stamps', jsonEncode(_readPmStamps));
   }
 
-  Future<Map<String, int>> _loadHiddenPmMap() async {
+  Future<void> _saveReadPostStamps() async {
     final prefs = await SharedPreferences.getInstance();
-    final raw = prefs.getString('hidden_pm_map');
-    if (raw == null) return {};
-    try {
-      final decoded = jsonDecode(raw) as Map<String, dynamic>;
-      return decoded.map((k, v) => MapEntry(k, (v as num).toInt()));
-    } catch (_) {
-      return {};
-    }
-  }
-
-  Future<void> _saveHiddenPmMap() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('hidden_pm_map', jsonEncode(_hiddenPmMap));
-  }
-
-  Future<void> _toggleHidePm(_ForumPrivateMessage pm) async {
-    if (_hiddenPmMap.containsKey(pm.key)) {
-      _hiddenPmMap.remove(pm.key);
-    } else {
-      _hiddenPmMap[pm.key] = pm.sortStamp;
-    }
-    await _saveHiddenPmMap();
-    if (!mounted) return;
-    setState(() {});
-  }
-
-
-  Future<void> _saveReadPostKeys() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setStringList('read_post_keys', _readPostKeys.toList());
+    await prefs.setString('read_post_stamps', jsonEncode(_readPostStamps));
   }
 
   Future<void> _markPostRead(_ForumPost post) async {
-    _readPostKeys.add(post.key);
-    await _saveReadPostKeys();
+    _readPostStamps[post.key] = post.sortStamp;
+    await _saveReadPostStamps();
 
     if (!mounted) return;
     setState(() {});
@@ -358,8 +356,8 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
   }
 
   Future<void> _markPostUnread(_ForumPost post) async {
-    _readPostKeys.remove(post.key);
-    await _saveReadPostKeys();
+    _readPostStamps.remove(post.key);
+    await _saveReadPostStamps();
 
     if (!mounted) return;
     setState(() {});
@@ -368,7 +366,7 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
   }
 
   /// Best-effort: updates the topic's read state on the NodeBB server.
-  /// Failures are silent (e.g. offline) — local _readPostKeys remains the
+  /// Failures are silent (e.g. offline) — local _readPostStamps remains the
   /// source of truth for the UI either way.
   Future<void> _setServerTopicReadState(_ForumPost post, bool read) async {
     try {
@@ -381,6 +379,13 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
 
   Future<void> _markPmRead(_ForumPrivateMessage pm) async {
     _readPmStamps[pm.key] = pm.sortStamp;
+    await _saveReadPmStamps();
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  Future<void> _markPmUnread(_ForumPrivateMessage pm) async {
+    _readPmStamps.remove(pm.key);
     await _saveReadPmStamps();
     if (!mounted) return;
     setState(() {});
@@ -405,6 +410,49 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
       _privateMessages.clear();
       _status = 'Forum setup saved.';
     });
+  }
+
+  /// Opens the full forum site (all categories, browsable like a normal
+  /// browser) in an in-app WebView, pre-authenticated with the same login
+  /// used for syncing. Triggered by long-pressing the "Posts" tab.
+  Future<void> _openForumWebView() async {
+    final activeSources = _sources.where((s) => s.baseUrl.trim().isNotEmpty).toList();
+
+    if (activeSources.isEmpty) {
+      setState(() => _status = 'No forum accounts configured. Tap the gear to add them.');
+      return;
+    }
+
+    ForumSource? chosen = activeSources.length == 1 ? activeSources.first : null;
+
+    if (chosen == null) {
+      chosen = await showModalBottomSheet<ForumSource>(
+        context: context,
+        builder: (context) => SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              const Padding(
+                padding: EdgeInsets.fromLTRB(16, 16, 16, 8),
+                child: Text('Open forum in browser view', style: TextStyle(fontWeight: FontWeight.bold)),
+              ),
+              for (final source in activeSources)
+                ListTile(
+                  leading: CircleAvatar(backgroundColor: Color(source.colorValue), radius: 8),
+                  title: Text(source.name),
+                  onTap: () => Navigator.pop(context, source),
+                ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (chosen == null || !mounted) return;
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => ForumWebViewScreen(source: chosen!)),
+    );
   }
 
   Future<void> _syncAll() async {
@@ -457,29 +505,18 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
       print('[SYNC] ${source.name}: total ${sourceStopwatch.elapsedMilliseconds}ms');
     }
 
-    // Auto-unhide PMs that received a new message since they were hidden
-    for (final pm in privateMessages) {
-      final hiddenStamp = _hiddenPmMap[pm.key];
-      if (hiddenStamp != null && pm.sortStamp > hiddenStamp) {
-        _hiddenPmMap.remove(pm.key);
-      }
-    }
-    await _saveHiddenPmMap();
+    // Note: PMs (and posts) that have been read but receive a newer reply
+    // are handled by _readPmStamps / _readPostStamps stamp comparison below
+    // — a PM only stays hidden while its sortStamp is <= the stamp recorded
+    // when it was marked read, and reappears once it has newer activity.
 
-    // Auto-mark-unread posts that NodeBB's server-side "unread" tray now
-    // reports as unread again (e.g. a new reply landed after we'd marked
-    // the post read). Only trust the genuine /api/unread feed for this —
-    // the /api/recent fallback can list topics the user has already read,
-    // and shouldn't resurrect them.
-    var readKeysChanged = false;
-    for (final p in posts) {
-      if (p.raw['_feedType'] == 'unread' && _readPostKeys.remove(p.key)) {
-        readKeysChanged = true;
-      }
-    }
-    if (readKeysChanged) {
-      await _saveReadPostKeys();
-    }
+    // Note: posts that NodeBB's "unread" tray still lists after being marked
+    // read no longer need special handling here. _readPostStamps records the
+    // sortStamp at the time a post was read, and a post only displays as
+    // unread again once its current sortStamp exceeds that stored value —
+    // i.e. it genuinely has new activity. This avoids previously-read posts
+    // bouncing back to "unread" purely because the server's unread tray
+    // didn't clear (e.g. the server-side mark-as-read call failed silently).
 
     if (!mounted) return;
 
@@ -518,7 +555,10 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     await _saveCache();
 
     // Update notification badge / status with current unread counts
-    final unreadPosts = _posts.where((p) => !_readPostKeys.contains(p.key)).length;
+    final unreadPosts = _posts.where((p) {
+      final readStamp = _readPostStamps[p.key];
+      return readStamp == null || p.sortStamp > readStamp;
+    }).length;
     final unreadPms = _privateMessages.where((pm) {
       final lastRead = _readPmStamps[pm.key];
       return lastRead == null || pm.sortStamp > lastRead;
@@ -702,8 +742,14 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
   Widget build(BuildContext context) {
     final onPostsTab = _tabController.index == 0;
     final onPmTab = _tabController.index == 2;
-    final hasHiddenPms = _privateMessages.any((pm) => _hiddenPmMap.containsKey(pm.key));
-    final hasReadPosts = _posts.any((p) => _readPostKeys.contains(p.key));
+    final hasReadPosts = _posts.any((p) {
+      final readStamp = _readPostStamps[p.key];
+      return readStamp != null && p.sortStamp <= readStamp;
+    });
+    final hasReadPms = _privateMessages.any((pm) {
+      final readStamp = _readPmStamps[pm.key];
+      return readStamp != null && pm.sortStamp <= readStamp;
+    });
 
     return Scaffold(
         appBar: AppBar(
@@ -715,11 +761,11 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
                 tooltip: _showReadPosts ? 'Hide read posts' : 'Show read posts',
                 onPressed: () => setState(() => _showReadPosts = !_showReadPosts),
               ),
-            if (onPmTab && hasHiddenPms)
+            if (onPmTab && hasReadPms)
               IconButton(
-                icon: Icon(_showHiddenPms ? Icons.visibility : Icons.visibility_off),
-                tooltip: _showHiddenPms ? 'Hide hidden PMs' : 'Show hidden PMs',
-                onPressed: () => setState(() => _showHiddenPms = !_showHiddenPms),
+                icon: Icon(_showReadPms ? Icons.visibility : Icons.visibility_off),
+                tooltip: _showReadPms ? 'Hide read PMs' : 'Show read PMs',
+                onPressed: () => setState(() => _showReadPms = !_showReadPms),
               ),
             IconButton(
               icon: const Icon(Icons.settings),
@@ -734,10 +780,24 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
           ],
           bottom: TabBar(
             controller: _tabController,
-            tabs: const [
-              Tab(icon: Icon(Icons.forum), text: 'Posts'),
-              Tab(icon: Icon(Icons.calendar_month), text: 'Calendar'),
-              Tab(icon: Icon(Icons.mail), text: "PM's"),
+            tabs: [
+              Tab(
+                // Long-press "Posts" to open the full forum site in an
+                // in-app browser (all categories, just like a real browser).
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onLongPress: _openForumWebView,
+                  child: const Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.forum),
+                      Text('Posts'),
+                    ],
+                  ),
+                ),
+              ),
+              const Tab(icon: Icon(Icons.calendar_month), text: 'Calendar'),
+              const Tab(icon: Icon(Icons.mail), text: "PM's"),
             ],
           ),
         ),
@@ -774,7 +834,8 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
     final query = _postSearchQuery.trim().toLowerCase();
 
     final visible = _posts.where((p) {
-      final isRead = _readPostKeys.contains(p.key);
+      final readStamp = _readPostStamps[p.key];
+      final isRead = readStamp != null && p.sortStamp <= readStamp;
       if (isRead && !_showReadPosts) return false;
 
       if (query.isEmpty) return true;
@@ -830,7 +891,8 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
                     itemBuilder: (context, index) {
                       final post = visible[index];
                       final color = Color(post.source.colorValue);
-                      final isRead = _readPostKeys.contains(post.key);
+                      final readStamp = _readPostStamps[post.key];
+                      final isRead = readStamp != null && post.sortStamp <= readStamp;
 
                       return Container(
                         color: isRead ? null : Theme.of(context).colorScheme.primary.withValues(alpha: 0.08),
@@ -1273,31 +1335,71 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
   }
 
   Widget _buildPrivateMessagesTab() {
-    final hasHidden = _privateMessages.any((pm) => _hiddenPmMap.containsKey(pm.key));
-    final visible = _showHiddenPms
-        ? _privateMessages
-        : _privateMessages.where((pm) => !_hiddenPmMap.containsKey(pm.key)).toList();
-
-    if (!hasHidden && visible.isEmpty) {
+    if (_privateMessages.isEmpty) {
       return const _EmptyState(icon: Icons.mail_outline, message: 'No private messages found.');
     }
 
-    return Column(
-      children: [
+    final query = _pmSearchQuery.trim().toLowerCase();
 
+    final visible = _privateMessages.where((pm) {
+      final readStamp = _readPmStamps[pm.key];
+      final isRead = readStamp != null && pm.sortStamp <= readStamp;
+      if (isRead && !_showReadPms) return false;
+
+      if (query.isEmpty) return true;
+      return pm.title.toLowerCase().contains(query) ||
+          pm.sender.toLowerCase().contains(query) ||
+          pm.source.name.toLowerCase().contains(query) ||
+          pm.body.toLowerCase().contains(query);
+    }).toList();
+
+    return GestureDetector(
+      behavior: HitTestBehavior.translucent,
+      onTap: () => FocusScope.of(context).unfocus(),
+      child: Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 8, 12, 0),
+          child: TextField(
+            controller: _pmSearchController,
+            textInputAction: TextInputAction.search,
+            decoration: InputDecoration(
+              hintText: 'Search private messages...',
+              prefixIcon: const Icon(Icons.search),
+              isDense: true,
+              border: const OutlineInputBorder(),
+              suffixIcon: _pmSearchQuery.isEmpty
+                  ? null
+                  : IconButton(
+                      icon: const Icon(Icons.clear),
+                      onPressed: () {
+                        _pmSearchController.clear();
+                        setState(() => _pmSearchQuery = '');
+                        FocusScope.of(context).unfocus();
+                      },
+                    ),
+            ),
+            onChanged: (value) => setState(() => _pmSearchQuery = value),
+            onSubmitted: (_) => FocusScope.of(context).unfocus(),
+          ),
+        ),
         Expanded(
           child: visible.isEmpty
-              ? const _EmptyState(icon: Icons.mail_outline, message: 'No visible messages. Tap "Show hidden" to see hidden ones.')
+              ? _EmptyState(
+                  icon: Icons.mail_outline,
+                  message: query.isNotEmpty
+                      ? 'No private messages match your search.'
+                      : 'No unread private messages. Tap the eye icon to show read ones.',
+                )
               : ListView.separated(
+                  keyboardDismissBehavior: ScrollViewKeyboardDismissBehavior.onDrag,
                   itemCount: visible.length,
                   separatorBuilder: (_, __) => const Divider(height: 1),
                   itemBuilder: (context, index) {
                     final pm = visible[index];
                     final color = Color(pm.source.colorValue);
-                    // Unread if never opened, or new messages arrived since last read
-                    final lastReadStamp = _readPmStamps[pm.key];
-                    final isRead = lastReadStamp != null && pm.sortStamp <= lastReadStamp;
-                    final isHidden = _hiddenPmMap.containsKey(pm.key);
+                    final readStamp = _readPmStamps[pm.key];
+                    final isRead = readStamp != null && pm.sortStamp <= readStamp;
 
                     return Container(
                       color: isRead ? null : Theme.of(context).colorScheme.primary.withValues(alpha: 0.08),
@@ -1307,11 +1409,12 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
                           pm.title,
                           style: TextStyle(
                             fontWeight: isRead ? FontWeight.normal : FontWeight.bold,
-                            color: isHidden ? Theme.of(context).disabledColor : null,
+                            color: isRead ? Theme.of(context).disabledColor : null,
                           ),
                         ),
                         subtitle: Text('${pm.source.name} • ${pm.sender} • ${_formatPmTimestamp(pm.sortStamp)}'),
                         onTap: () async {
+                          FocusScope.of(context).unfocus();
                           await _markPmRead(pm);
                           if (!mounted) return;
                           await Navigator.of(context).push(
@@ -1322,12 +1425,12 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
                         },
                         trailing: IconButton(
                           icon: Icon(
-                            isHidden ? Icons.visibility : Icons.visibility_off,
+                            isRead ? Icons.undo : Icons.check,
                             size: 20,
-                            color: isHidden ? Theme.of(context).colorScheme.primary : Theme.of(context).disabledColor,
+                            color: isRead ? Theme.of(context).colorScheme.primary : Theme.of(context).disabledColor,
                           ),
-                          tooltip: isHidden ? 'Unhide' : 'Hide',
-                          onPressed: () => _toggleHidePm(pm),
+                          tooltip: isRead ? 'Mark unread' : 'Mark read',
+                          onPressed: () => isRead ? _markPmUnread(pm) : _markPmRead(pm),
                         ),
                       ),
                     );
@@ -1335,6 +1438,7 @@ class _ForumAggregatorHomeState extends State<ForumAggregatorHome>
                 ),
         ),
       ],
+      ),
     );
   }
 
@@ -2047,6 +2151,75 @@ class _ForumSetupScreenState extends State<ForumSetupScreen> {
     super.dispose();
   }
 
+  Future<void> _pickColor(_ForumSourceControllers c) async {
+    final palette = <int>[for (final color in Colors.primaries) color.toARGB32()];
+
+    final picked = await showDialog<int>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Choose a color'),
+        content: SizedBox(
+          width: 320,
+          child: Wrap(
+            spacing: 12,
+            runSpacing: 12,
+            children: [
+              for (final value in palette)
+                GestureDetector(
+                  onTap: () => Navigator.of(context).pop(value),
+                  child: CircleAvatar(
+                    backgroundColor: Color(value),
+                    radius: 18,
+                    child: value == c.colorValue ? const Icon(Icons.check, color: Colors.white, size: 18) : null,
+                  ),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Cancel')),
+        ],
+      ),
+    );
+
+    if (picked != null) {
+      setState(() => c.colorValue = picked);
+    }
+  }
+
+  Future<void> _showAppAbout() async {
+    PackageInfo? info;
+    try {
+      info = await PackageInfo.fromPlatform();
+    } catch (_) {
+      // Ignore — fall back to showing the dialog without version info.
+    }
+    if (!mounted) return;
+
+    // Built manually (instead of showAboutDialog/AboutDialog) so we can omit
+    // the default "VIEW LICENSES" button.
+    showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(info?.appName ?? 'Forum Scanner'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            if (info != null) Text('Version ${info.version} (build ${info.buildNumber})'),
+            const SizedBox(height: 12),
+            const Text('Aggregates new posts, calendar events, and private messages from your NodeBB forum accounts.'),
+            const SizedBox(height: 12),
+            Text('© ${DateTime.now().year} Forum Scanner'),
+          ],
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('Close')),
+        ],
+      ),
+    );
+  }
+
   void _save() {
     final sources = <ForumSource>[];
 
@@ -2074,8 +2247,21 @@ class _ForumSetupScreenState extends State<ForumSetupScreen> {
       ),
       body: ListView.builder(
         padding: const EdgeInsets.all(12),
-        itemCount: _controllers.length,
+        itemCount: _controllers.length + 1,
         itemBuilder: (context, index) {
+          if (index == _controllers.length) {
+            return Card(
+              margin: const EdgeInsets.only(bottom: 12),
+              child: ListTile(
+                leading: const Icon(Icons.info_outline),
+                title: const Text('About Forum Scanner'),
+                subtitle: const Text('Version, build info, and app details'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: _showAppAbout,
+              ),
+            );
+          }
+
           final c = _controllers[index];
           final color = Color(c.colorValue);
 
@@ -2087,9 +2273,19 @@ class _ForumSetupScreenState extends State<ForumSetupScreen> {
                 children: [
                   Row(
                     children: [
-                      CircleAvatar(backgroundColor: color, radius: 8),
+                      GestureDetector(
+                        onTap: () => _pickColor(c),
+                        child: CircleAvatar(backgroundColor: color, radius: 12),
+                      ),
                       const SizedBox(width: 8),
-                      Text('Forum ${index + 1}', style: Theme.of(context).textTheme.titleMedium),
+                      Expanded(
+                        child: Text('Forum ${index + 1}', style: Theme.of(context).textTheme.titleMedium),
+                      ),
+                      TextButton.icon(
+                        onPressed: () => _pickColor(c),
+                        icon: const Icon(Icons.palette_outlined, size: 18),
+                        label: const Text('Color'),
+                      ),
                     ],
                   ),
                   TextField(controller: c.name, decoration: const InputDecoration(labelText: 'Display Name')),
@@ -2108,7 +2304,7 @@ class _ForumSetupScreenState extends State<ForumSetupScreen> {
 
 class _ForumSourceControllers {
   final String id;
-  final int colorValue;
+  int colorValue;
   final TextEditingController name;
   final TextEditingController baseUrl;
   final TextEditingController username;

@@ -1,5 +1,6 @@
 import 'dart:convert';
 
+import 'package:flutter/widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
 
@@ -24,6 +25,11 @@ const Duration kBackgroundTaskFrequency = Duration(minutes: 20);
 void callbackDispatcher() {
   Workmanager().executeTask((task, inputData) async {
     try {
+      // Required before touching any plugin (SharedPreferences,
+      // flutter_local_notifications, etc.) from this headless background
+      // isolate — without it, plugin channel calls can throw and get
+      // swallowed by the catch below, making the task silently no-op.
+      WidgetsFlutterBinding.ensureInitialized();
       await checkForNewContentInBackground();
     } catch (_) {
       // A failed background check shouldn't crash retries forever —
@@ -45,7 +51,18 @@ Future<void> checkForNewContentInBackground() async {
   if (activeSources.isEmpty) return;
 
   final prefs = await SharedPreferences.getInstance();
-  final readPostKeys = prefs.getStringList('read_post_keys')?.toSet() ?? <String>{};
+
+  // Maps post key → sortStamp at the time it was marked read (mirrors
+  // _readPostStamps in main.dart). A topic only counts as unread if it was
+  // never read, or its current sortStamp is newer than the stored one.
+  Map<String, int> readPostStamps = {};
+  final rawPostStamps = prefs.getString('read_post_stamps');
+  if (rawPostStamps != null && rawPostStamps.isNotEmpty) {
+    try {
+      final decoded = jsonDecode(rawPostStamps) as Map;
+      readPostStamps = decoded.map((k, v) => MapEntry(k.toString(), (v as num).toInt()));
+    } catch (_) {}
+  }
 
   Map<String, int> readPmStamps = {};
   final rawPmStamps = prefs.getString('read_pm_stamps');
@@ -74,7 +91,15 @@ Future<void> checkForNewContentInBackground() async {
         final tid = (topic['tid'] ?? topic['topic']?['tid'] ?? topic['slug'] ?? topic['title'] ?? '').toString();
         if (tid.trim().isEmpty) continue;
         final key = '${source.id}:$tid';
-        if (!readPostKeys.contains(key)) unreadPosts++;
+
+        final createdStamp = _parseForumStamp(topic['timestamp'] ?? topic['timestampISO'] ?? topic['createdAt']);
+        final lastReplyStamp = _parseForumStamp(
+          topic['lastposttime'] ?? topic['lastposttimeISO'] ?? topic['lastPostTime'] ?? topic['lastpost']?['timestamp'],
+        );
+        final sortStamp = lastReplyStamp != 0 ? lastReplyStamp : createdStamp;
+
+        final readStamp = readPostStamps[key];
+        if (readStamp == null || sortStamp > readStamp) unreadPosts++;
       }
 
       // Count unread PMs (mirrors _parsePrivateMessages key logic in main.dart).
@@ -115,4 +140,40 @@ Future<void> registerBackgroundSync() async {
     constraints: Constraints(networkType: NetworkType.connected),
     existingWorkPolicy: ExistingPeriodicWorkPolicy.replace,
   );
+}
+
+/// Mirrors _parseForumDate in main.dart. Kept as a local copy to avoid a
+/// circular import (main.dart already imports this file).
+DateTime? _parseForumDate(dynamic value) {
+  if (value == null) return null;
+  if (value is DateTime) return value;
+
+  int? numeric;
+
+  if (value is int) {
+    numeric = value;
+  } else if (value is double) {
+    numeric = value.round();
+  } else {
+    final text = value.toString().trim();
+    if (text.isEmpty) return null;
+
+    numeric = int.tryParse(text);
+    if (numeric == null) {
+      return DateTime.tryParse(text);
+    }
+  }
+
+  // 10 digits = seconds, 13 digits = milliseconds
+  if (numeric.abs() < 100000000000) {
+    return DateTime.fromMillisecondsSinceEpoch(numeric * 1000);
+  }
+
+  return DateTime.fromMillisecondsSinceEpoch(numeric);
+}
+
+/// Mirrors _parseForumStamp in main.dart.
+int _parseForumStamp(dynamic value) {
+  final parsed = _parseForumDate(value);
+  return parsed?.millisecondsSinceEpoch ?? 0;
 }
